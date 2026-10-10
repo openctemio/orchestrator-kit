@@ -1,0 +1,55 @@
+{
+  "$comment": "Copy the providers you want into octl.json under council.providers and set enabled: true. Only the claude presets were verified against the installed CLI (2.1.293). The other agent CLIs were NOT installed when this was written: their flags are unverified - check `<cli> --help` before enabling. Every agent-cli provider runs in a read-only temp copy of the listed files with a stripped environment (PATH, HOME, locale, plus env_keep).",
+  "council": {
+    "providers": {
+      "claude-cli": {
+        "type": "claude-cli", "enabled": true, "max_budget_usd": 0.5, "timeout": 600, "bare": false, "allow_read": false
+      },
+      "claude-agent": {
+        "$comment": "verified: same CLI through the generic agent-cli path",
+        "type": "agent-cli", "enabled": false, "external": false,
+        "cmd": ["claude", "-p", "--model", "{model}", "--permission-mode", "dontAsk", "--no-session-persistence",
+                "--max-budget-usd", "0.5", "--output-format", "json",
+                "--disallowedTools", "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Agent"],
+        "prompt_via": "stdin", "output": "json", "json_path": "result", "timeout": 600, "est_usd_per_call": 0.5
+      },
+      "anthropic-api": {
+        "type": "anthropic-api", "enabled": false, "key_env": "ANTHROPIC_API_KEY", "max_tokens": 4000,
+        "est_usd_per_call": 0.25,
+        "models": {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5", "haiku": "claude-haiku-4-5"}
+      },
+      "local-model": {
+        "$comment": "any server with an HTTP chat-completions endpoint on loopback; not external",
+        "type": "openai-compatible", "enabled": false, "base_url": "http://127.0.0.1:8080/v1", "key_env": "",
+        "models": {"sonnet": "your-local-model"}, "max_tokens": 2000, "json_mode": true, "est_usd_per_call": 0
+      },
+      "remote-vendor": {
+        "$comment": "external: also needs allow_external here and --allow-external on the command line",
+        "type": "openai-compatible", "enabled": false, "allow_external": false,
+        "base_url": "https://api.example.com/v1", "key_env": "REMOTE_VENDOR_API_KEY",
+        "models": {"sonnet": "vendor-model-id"}, "max_tokens": 2000, "est_usd_per_call": 0.2
+      },
+      "opencode": {
+        "$comment": "UNVERIFIED - check `opencode --help` (run subcommand, model flag, output format) before enabling",
+        "type": "agent-cli", "enabled": false, "allow_external": false,
+        "cmd": ["opencode", "run", "--model", "{model}", "{prompt}"],
+        "prompt_via": "argv", "output": "text", "timeout": 600, "env_keep": [], "est_usd_per_call": 0.3,
+        "models": {"sonnet": "provider/model-id"}
+      },
+      "codex": {
+        "$comment": "UNVERIFIED - check `codex --help` (non-interactive subcommand, sandbox/read-only flag) before enabling",
+        "type": "agent-cli", "enabled": false, "allow_external": false,
+        "cmd": ["codex", "exec", "--model", "{model}", "{prompt}"],
+        "prompt_via": "argv", "output": "text", "timeout": 600, "env_keep": [], "est_usd_per_call": 0.3,
+        "models": {"sonnet": "model-id"}
+      },
+      "gemini": {
+        "$comment": "UNVERIFIED - check `gemini --help` (prompt flag, model flag) before enabling",
+        "type": "agent-cli", "enabled": false, "allow_external": false,
+        "cmd": ["gemini", "--model", "{model}", "--prompt", "{prompt}"],
+        "prompt_via": "argv", "output": "text", "timeout": 600, "env_keep": [], "est_usd_per_call": 0.3,
+        "models": {"sonnet": "model-id"}
+      }
+    }
+  }
+}

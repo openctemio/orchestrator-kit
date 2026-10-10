@@ -1,0 +1,11 @@
+{
+  "name": "orchestrator-kit",
+  "displayName": "Orchestrator Kit",
+  "version": "0.1.0",
+  "description": "Run software development with several Claude Code agents: model routing, staged workflow with gates, task board, merge-queue watcher, guarded deploys, safety hooks, token budgets and an advisor council.",
+  "author": { "name": "OpenCTEM", "email": "info@openctem.io", "url": "https://openctem.io" },
+  "homepage": "https://github.com/openctemio/claude-kit",
+  "repository": "https://github.com/openctemio/claude-kit",
+  "license": "Apache-2.0",
+  "keywords": ["orchestration", "multi-agent", "workflow", "code-review", "token-budget", "safety"]
+}

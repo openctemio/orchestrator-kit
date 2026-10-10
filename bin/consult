@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+"""consult - ask a council of independent advisors about one decision, then combine their advice.
+
+  consult "QUESTION" [-c FILE ...] [--risk low|med|high] [--rounds 1|2] [--synth] [--dry-run]
+          [--config octl.json] [--out DIR]
+
+Each advisor is a fresh, blind, read-only model call that gets only the question and the files you list
+(never the conversation), answers in a fixed JSON schema (position, reasons, risks, what would change its
+mind, confidence) and may revise once after seeing the anonymised others (rounds: 2). The record is saved
+to .claude/council/<timestamp>-<slug>.md with a JSON sidecar; audit.log records which provider saw which files.
+
+Providers (octl.json "council.providers"): claude-cli (default; your Claude Code login), anthropic-api
+(ANTHROPIC_API_KEY, pay per token), openai-compatible (any HTTP chat-completions server: another vendor or a
+local model). Keys come only from environment variables and are never logged. Python 3.10+, stdlib only.
+"""
+import concurrent.futures
+import datetime as dt
+import ipaddress
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import sys
+import urllib.parse
+import urllib.request
+
+ADVICE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["position", "reasons", "risks", "change_my_mind", "confidence"],
+    "properties": {
+        "position": {"type": "string"},
+        "reasons": {"type": "array", "items": {"type": "string"}},
+        "risks": {"type": "array", "items": {"type": "string"}},
+        "change_my_mind": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    },
+}
+SYNTH_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["agreement", "disagreements", "recommendation", "open_questions"],
+    "properties": {
+        "agreement": {"type": "array", "items": {"type": "string"}},
+        "disagreements": {"type": "array", "items": {
+            "type": "object", "additionalProperties": False,
+            "required": ["point", "strongest_for", "strongest_against"],
+            "properties": {"point": {"type": "string"}, "strongest_for": {"type": "string"},
+                           "strongest_against": {"type": "string"}}}},
+        "recommendation": {"type": "string"},
+        "open_questions": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
+ROLES = {
+    "architect": "You are a software architect. Judge structure, coupling, long-term maintainability and how the "
+                 "decision constrains future work.",
+    "security": "You are a security reviewer. Judge authorization, data isolation, secrets, injection, abuse cases "
+                "and the blast radius when something goes wrong.",
+    "implementer": "You are a pragmatic senior implementer. Judge effort, risk of delivery, testability and the "
+                   "simplest design that meets today's need.",
+    "devil": "You are the devil's advocate. Argue the strongest case against the most likely choice and surface "
+             "the assumption most likely to be wrong.",
+    "operations": "You are responsible for operations and cost. Judge running cost, failure modes, observability, "
+                  "migration and rollback.",
+}
+
+DEFAULTS = {
+    "rounds": 1,
+    "advisors": [
+        {"role": "architect", "provider": "claude-cli", "model": "sonnet", "effort": "medium"},
+        {"role": "security", "provider": "claude-cli", "model": "sonnet", "effort": "medium"},
+        {"role": "devil", "provider": "claude-cli", "model": "opus", "effort": "high"},
+    ],
+    "high_risk_extra": [
+        {"role": "implementer", "provider": "claude-cli", "model": "sonnet", "effort": "medium"},
+        {"role": "operations", "provider": "claude-cli", "model": "sonnet", "effort": "medium"},
+    ],
+    "synth": {"provider": "claude-cli", "model": "opus", "effort": "medium"},
+    "max_council_usd": 3.0,
+    "max_file_kb": 200,
+    "max_total_kb": 400,
+    "out_dir": ".claude/council",
+    "providers": {
+        "claude-cli": {"type": "claude-cli", "enabled": True, "max_budget_usd": 0.5, "timeout": 600,
+                       "bare": False, "allow_read": False},
+        "anthropic-api": {"type": "anthropic-api", "enabled": False, "key_env": "ANTHROPIC_API_KEY",
+                          "base_url": "https://api.anthropic.com", "max_tokens": 4000, "timeout": 300,
+                          "est_usd_per_call": 0.25,
+                          "models": {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5",
+                                     "haiku": "claude-haiku-4-5"}},
+    },
+}
+
+SECRET_FILE = re.compile(r"(^|/)\.env(\.[A-Za-z0-9_.-]+)?$|(^|/)(id_rsa|id_ed25519|id_ecdsa)(\.pub)?$|\.(pem|key|p12|pfx|kdbx)$"
+                         r"|(^|/)(credentials|\.netrc|\.pgpass|\.npmrc|\.pypirc)$")
+REDACT = [
+    ("private-key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S)),
+    ("aws-key", re.compile(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("github-token", re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})\b")),
+    ("api-key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b")),
+    ("slack-token", re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{10,}\b")),
+    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")),
+    ("url-credentials", re.compile(r"(?<=://)[^/\s:@]+:[^/\s@]+(?=@)")),
+    ("assignment", re.compile(r"(?i)\b([A-Z0-9_]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key)[A-Z0-9_]*)"
+                              r"(\s*[:=]\s*)(['\"]?)[^\s'\"]{6,}\3")),
+]
+
+
+class Refused(Exception):
+    pass
+
+
+class Unstructured(Exception):
+    """The advisor answered, but not in the schema; the raw text is kept and marked unstructured."""
+
+    def __init__(self, raw):
+        super().__init__("unstructured answer")
+        self.raw = raw
+
+
+# ---------------------------------------------------------------- config
+def find_config(path=None):
+    if path:
+        return path
+    if os.environ.get("OCTL_CONFIG"):
+        return os.environ["OCTL_CONFIG"]
+    d = os.getcwd()
+    while True:
+        if os.path.isfile(os.path.join(d, "octl.json")):
+            return os.path.join(d, "octl.json")
+        if os.path.dirname(d) == d:
+            return ""
+        d = os.path.dirname(d)
+
+
+def load_config(path):
+    cfg = json.loads(json.dumps(DEFAULTS))
+    root = os.getcwd()
+    if path:
+        with open(path) as fh:
+            raw = json.load(fh)
+        root = os.path.abspath(raw.get("root") or os.path.dirname(os.path.abspath(path)))
+        for k, v in (raw.get("council") or {}).items():
+            if k == "providers":
+                for name, p in v.items():
+                    cfg["providers"][name] = {**cfg["providers"].get(name, {}), **p}
+            else:
+                cfg[k] = v
+    cfg["root"] = root
+    for name, p in cfg["providers"].items():
+        if p.get("type") not in ("claude-cli", "anthropic-api", "openai-compatible", "agent-cli"):
+            raise SystemExit(f"council.providers.{name}: unknown type {p.get('type')!r}")
+    return cfg
+
+
+# ---------------------------------------------------------------- schema + egress
+def validate(obj, schema, path="$"):
+    """Small JSON-schema subset validator (type, required, additionalProperties, items, min/max)."""
+    t = schema.get("type")
+    types = {"object": dict, "array": list, "string": str, "boolean": bool}
+    if t == "number":
+        if not isinstance(obj, (int, float)) or isinstance(obj, bool):
+            return [f"{path}: expected number"]
+        errs = []
+        if "minimum" in schema and obj < schema["minimum"]:
+            errs.append(f"{path}: below {schema['minimum']}")
+        if "maximum" in schema and obj > schema["maximum"]:
+            errs.append(f"{path}: above {schema['maximum']}")
+        return errs
+    if t in types and not isinstance(obj, types[t]):
+        return [f"{path}: expected {t}"]
+    errs = []
+    if t == "object":
+        for k in schema.get("required", []):
+            if k not in obj:
+                errs.append(f"{path}: missing {k}")
+        props = schema.get("properties", {})
+        for k, v in obj.items():
+            if k in props:
+                errs += validate(v, props[k], f"{path}.{k}")
+            elif schema.get("additionalProperties") is False:
+                errs.append(f"{path}: unexpected {k}")
+    if t == "array" and "items" in schema:
+        for i, v in enumerate(obj):
+            errs += validate(v, schema["items"], f"{path}[{i}]")
+    return errs
+
+
+def redact(text):
+    counts = {}
+    for kind, pat in REDACT:
+        def sub(m, kind=kind):
+            counts[kind] = counts.get(kind, 0) + 1
+            if kind == "assignment":
+                return f"{m.group(1)}{m.group(2)}[REDACTED]"
+            return f"[REDACTED:{kind}]"
+        text = pat.sub(sub, text)
+    return text, counts
+
+
+def load_context(files, cfg):
+    """Read only the listed files; refuse secret files, oversize files and paths outside the project."""
+    out, total = [], 0
+    root = os.path.realpath(cfg["root"])
+    for f in files:
+        real = os.path.realpath(f)
+        if not (real == root or real.startswith(root + "/")):
+            raise Refused(f"{f}: outside the project root {root}")
+        if SECRET_FILE.search(real):
+            raise Refused(f"{f}: looks like a secrets file; never sent to advisors")
+        size = os.path.getsize(real)
+        if size > cfg["max_file_kb"] * 1024:
+            raise Refused(f"{f}: {size // 1024} KB is above max_file_kb {cfg['max_file_kb']}")
+        total += size
+        if total > cfg["max_total_kb"] * 1024:
+            raise Refused(f"context above max_total_kb {cfg['max_total_kb']}")
+        with open(real, errors="replace") as fh:
+            body, counts = redact(fh.read())
+        out.append({"path": os.path.relpath(real, root), "body": body, "redactions": counts})
+    return out
+
+
+def is_external(p):
+    """claude-cli and anthropic-api reach the same vendor as the session; an HTTP provider is external unless
+    its host is loopback."""
+    if p["type"] == "agent-cli":
+        return p.get("external", True)  # an arbitrary CLI may send the prompt anywhere
+    if p["type"] != "openai-compatible":
+        return False
+    host = urllib.parse.urlparse(p.get("base_url", "")).hostname or ""
+    if host == "localhost":
+        return False
+    try:
+        return not ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return True
+
+
+def check_provider(name, cfg, allow_external):
+    p = cfg["providers"].get(name)
+    if not p:
+        raise Refused(f"provider {name!r} is not configured")
+    if not p.get("enabled"):
+        raise Refused(f"provider {name!r} is disabled (council.providers.{name}.enabled)")
+    if is_external(p) and not (p.get("allow_external") and allow_external):
+        raise Refused(f"provider {name!r} is external: set allow_external in its config and pass --allow-external")
+    if p["type"] == "agent-cli" and (not isinstance(p.get("cmd"), list) or not p["cmd"]):
+        raise Refused(f"provider {name!r}: cmd must be a non-empty list")
+    if p["type"] in ("anthropic-api", "openai-compatible") and p.get("key_env") and not os.environ.get(p["key_env"]):
+        raise Refused(f"provider {name!r}: environment variable {p['key_env']} is not set")
+    if p["type"] == "openai-compatible":
+        u = urllib.parse.urlparse(p.get("base_url", ""))
+        if u.scheme != "https" and is_external(p):
+            raise Refused(f"provider {name!r}: external base_url must be https")
+    return p
+
+
+def call_cost_cap(p):
+    return float(p.get("max_budget_usd") if p["type"] == "claude-cli" else p.get("est_usd_per_call", 0.25))
+
+
+# ---------------------------------------------------------------- prompts
+def advisor_prompt(question, context, role, others=None):
+    parts = [ROLES.get(role, f"You are an advisor with the role: {role}."),
+             "You are one of several independent advisors. Others answer separately; you cannot see the session "
+             "that asked. Use only the question and the files below. Be concrete and brief: at most 5 reasons and "
+             "5 risks, one sentence each. confidence is 0 to 1.",
+             f"QUESTION:\n{question}"]
+    for c in context:
+        parts.append(f"FILE {c['path']}:\n```\n{c['body']}\n```")
+    if others:
+        parts.append("Other advisors answered (anonymised). Revise your answer only if an argument persuades "
+                     "you; say what changed in your reasons. Do not just follow the majority.")
+        for i, o in enumerate(others):
+            parts.append(f"ADVISOR {chr(65 + i)}: {json.dumps(o)}")
+    parts.append("Answer with JSON only, matching the schema: position, reasons, risks, change_my_mind, confidence.")
+    return "\n\n".join(parts)
+
+
+def synth_prompt(question, results):
+    lines = ["Combine these independent advisors' answers into a decision record. Name agreement, each real "
+             "disagreement with the strongest argument on each side, a recommendation, and open questions. "
+             "Weigh arguments, not votes.", f"QUESTION:\n{question}"]
+    for r in results:
+        lines.append(f"{r['role']} ({r['model']}): {json.dumps(r['advice'])}")
+    lines.append("Answer with JSON only: agreement, disagreements[{point, strongest_for, strongest_against}], "
+                 "recommendation, open_questions.")
+    return "\n\n".join(lines)
+
+
+# ---------------------------------------------------------------- providers
+def extract_json(text):
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-z]*\n|\n```$", "", text)
+    try:
+        return json.loads(text)
+    except ValueError:
+        a, b = text.find("{"), text.rfind("}")
+        if a >= 0 and b > a:
+            return json.loads(text[a:b + 1])
+        raise
+
+
+def cli_command(p, model, effort, schema):
+    cmd = ["claude", "-p", "--model", model, "--effort", effort, "--output-format", "json",
+           "--json-schema", json.dumps(schema), "--no-session-persistence",
+           "--max-budget-usd", str(p.get("max_budget_usd", 0.5)), "--permission-mode", "dontAsk"]
+    if p.get("bare"):
+        cmd.append("--bare")
+    if p.get("allow_read"):
+        cmd += ["--allowedTools", "Read,Grep,Glob"]
+    cmd += ["--disallowedTools", "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Agent"]
+    return cmd
+
+
+def run_claude_cli(p, model, effort, prompt, schema, runner=subprocess.run):
+    r = runner(cli_command(p, model, effort, schema), input=prompt, capture_output=True, text=True,
+               timeout=p.get("timeout", 600))
+    try:
+        out = json.loads(r.stdout)
+    except ValueError:
+        raise RuntimeError(f"claude -p exit {r.returncode}: {(r.stderr or r.stdout)[-300:]}")
+    data = out.get("structured_output")
+    if data is None:
+        data = extract_json(out.get("result") or "")
+    return data, float(out.get("total_cost_usd") or 0)
+
+
+def http_post(url, body, headers, timeout, opener=urllib.request.urlopen):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers, method="POST")
+    with opener(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def run_anthropic_api(p, model, effort, prompt, schema, post=http_post):
+    body = {"model": p.get("models", {}).get(model, model), "max_tokens": int(p.get("max_tokens", 4000)),
+            "messages": [{"role": "user", "content": prompt}],
+            "output_config": {"effort": effort, "format": {"type": "json_schema", "schema": schema}}}
+    headers = {"x-api-key": os.environ[p["key_env"]], "anthropic-version": "2023-06-01",
+               "content-type": "application/json"}
+    d = post(p["base_url"].rstrip("/") + "/v1/messages", body, headers, p.get("timeout", 300))
+    if d.get("stop_reason") == "refusal":
+        raise RuntimeError("model declined")
+    text = next((b.get("text", "") for b in d.get("content", []) if b.get("type") == "text"), "")
+    return extract_json(text), 0.0
+
+
+def run_openai_compatible(p, model, effort, prompt, schema, post=http_post):
+    body = {"model": p.get("models", {}).get(model, p.get("model", model)),
+            "max_tokens": int(p.get("max_tokens", 2000)),
+            "messages": [{"role": "system", "content": "Answer with one JSON object only. Schema: " + json.dumps(schema)},
+                         {"role": "user", "content": prompt}]}
+    if p.get("json_mode"):
+        body["response_format"] = {"type": "json_object"}
+    headers = {"content-type": "application/json"}
+    if p.get("key_env"):
+        headers["authorization"] = "Bearer " + os.environ[p["key_env"]]
+    d = post(p["base_url"].rstrip("/") + "/chat/completions", body, headers, p.get("timeout", 300))
+    return extract_json(d["choices"][0]["message"]["content"]), 0.0
+
+
+SAFE_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME")
+
+
+def sandbox_dir(context):
+    """Temp dir holding read-only copies of only the listed (already redacted) files."""
+    d = tempfile.mkdtemp(prefix="council-")
+    for c in context:
+        dst = os.path.join(d, c["path"])
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with open(dst, "w") as fh:
+            fh.write(c["body"])
+        os.chmod(dst, 0o444)
+    for root, dirs, _ in os.walk(d):
+        for x in dirs:
+            os.chmod(os.path.join(root, x), 0o555)
+    os.chmod(d, 0o555)
+    return d
+
+
+def remove_sandbox(d):
+    for root, dirs, files in os.walk(d):
+        os.chmod(root, 0o755)
+        for x in dirs:
+            os.chmod(os.path.join(root, x), 0o755)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def agent_cli_command(p, model, prompt):
+    out = []
+    for part in p["cmd"]:
+        part = part.replace("{model}", p.get("models", {}).get(model, model))
+        if "{prompt}" in part:
+            if p.get("prompt_via", "argv") != "argv":
+                raise Refused("{prompt} in cmd requires prompt_via argv")
+            if len(prompt.encode()) > 120_000:
+                raise Refused("prompt too long for argv; use prompt_via stdin")
+            part = part.replace("{prompt}", prompt)
+        out.append(part)
+    return out
+
+
+def run_agent_cli(p, model, effort, prompt, schema, runner=subprocess.run, context=()):
+    """Any coding-agent CLI: runs in a read-only temp copy of the listed files, with a stripped environment."""
+    prompt = prompt + ("\n\nReply with exactly one fenced ```json block containing the object, nothing else.")
+    env = {k: os.environ[k] for k in SAFE_ENV + tuple(p.get("env_keep", [])) if k in os.environ}
+    d = sandbox_dir(context)
+    try:
+        r = runner(agent_cli_command(p, model, prompt), input=prompt if p.get("prompt_via") == "stdin" else None,
+                   capture_output=True, text=True, timeout=p.get("timeout", 600), cwd=d, env=env)
+    finally:
+        remove_sandbox(d)
+    raw = r.stdout or ""
+    if r.returncode != 0 and not raw.strip():
+        raise RuntimeError(f"{p['cmd'][0]} exit {r.returncode}: {(r.stderr or '')[-300:]}")
+    text = raw
+    if p.get("output") == "json":
+        try:
+            doc = json.loads(raw)
+            text = doc.get(p.get("json_path", "result"), raw) if isinstance(doc, dict) else raw
+            if isinstance(text, dict):
+                return text, float(doc.get("total_cost_usd") or 0)
+        except ValueError:
+            pass
+    m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.S)
+    try:
+        return (json.loads(m.group(1)) if m else extract_json(text)), 0.0
+    except (ValueError, AttributeError):
+        raise Unstructured(text.strip()[:4000])
+
+
+RUNNERS = {"agent-cli": run_agent_cli, "claude-cli": run_claude_cli, "anthropic-api": run_anthropic_api, "openai-compatible": run_openai_compatible}
+
+
+def ask(p, model, effort, prompt, schema, context=()):
+    if p["type"] == "agent-cli":
+        data, cost = run_agent_cli(p, model, effort, prompt, schema, context=context)
+    else:
+        data, cost = RUNNERS[p["type"]](p, model, effort, prompt, schema)
+    errs = validate(data, schema)
+    if errs:
+        if p["type"] == "agent-cli":
+            raise Unstructured(json.dumps(data)[:4000])
+        raise RuntimeError("answer does not match the schema: " + "; ".join(errs[:3]))
+    return data, cost
+
+
+# ---------------------------------------------------------------- council
+def pick_advisors(cfg, risk):
+    adv = list(cfg["advisors"])
+    if risk == "high":
+        adv += cfg.get("high_risk_extra", [])
+    return adv
+
+
+def plan(cfg, advisors, rounds, synth, allow_external):
+    """Check providers and the council budget before any call. Returns (providers by advisor, cap)."""
+    provs = [check_provider(a["provider"], cfg, allow_external) for a in advisors]
+    cap = sum(call_cost_cap(p) for p in provs) * rounds
+    if synth:
+        cap += call_cost_cap(check_provider(cfg["synth"]["provider"], cfg, allow_external))
+    if cap > float(cfg["max_council_usd"]):
+        raise Refused(f"worst-case cost ${cap:.2f} is above max_council_usd ${cfg['max_council_usd']:.2f}: "
+                      "use fewer advisors or rounds, or lower per-call caps")
+    return provs, cap
+
+
+def slugify(s):
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:50] or "council"
+
+
+def run_council(question, files, cfg, risk="med", rounds=None, synth=False, dry_run=False,
+                allow_external=False, out=print):
+    rounds = int(rounds or cfg["rounds"])
+    if rounds not in (1, 2):
+        raise Refused("rounds must be 1 or 2")
+    context = load_context(files, cfg)
+    advisors = pick_advisors(cfg, risk)
+    provs, cap = plan(cfg, advisors, rounds, synth, allow_external)
+    if dry_run:
+        out(f"council: {len(advisors)} advisors x {rounds} round(s), worst-case ${cap:.2f} "
+            f"(cap ${cfg['max_council_usd']:.2f}); files: {', '.join(c['path'] for c in context) or 'none'}")
+        for a, p in zip(advisors, provs):
+            prompt = advisor_prompt(question, context, a["role"])
+            if p["type"] == "claude-cli":
+                cmd = " ".join(cli_command(p, a["model"], a["effort"], ADVICE_SCHEMA)[:8]) + " ... < prompt"
+            elif p["type"] == "agent-cli":
+                cmd = " ".join(x if "{prompt}" not in x else "<prompt>" for x in p["cmd"]).replace(
+                    "{model}", p.get("models", {}).get(a["model"], a["model"])) + " (read-only temp copy, stripped env)"
+            else:
+                cmd = f"POST {p.get('base_url')} model={a['model']}"
+            out(f"  {a['role']:12} {a['provider']:18} {a['model']:7} {a['effort']:7} prompt {len(prompt)} chars  {cmd}")
+        return None
+
+    def one(i, others=None):
+        a, p = advisors[i], provs[i]
+        try:
+            adv, cost = ask(p, a["model"], a["effort"], advisor_prompt(question, context, a["role"], others),
+                            ADVICE_SCHEMA, context)
+            return {"role": a["role"], "provider": a["provider"], "model": a["model"], "advice": adv, "cost": cost}
+        except Unstructured as u:
+            return {"role": a["role"], "provider": a["provider"], "model": a["model"], "unstructured": u.raw,
+                    "cost": call_cost_cap(p)}
+        except Exception as e:  # one failed advisor must not sink the council
+            return {"role": a["role"], "provider": a["provider"], "model": a["model"], "error": str(e)[:300], "cost": 0.0}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(advisors)) as ex:
+        r1 = list(ex.map(one, range(len(advisors))))
+    spent = sum(r["cost"] for r in r1)
+    r2 = None
+    if rounds == 2:
+        ok = [r for r in r1 if "advice" in r]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(advisors)) as ex:
+            r2 = list(ex.map(lambda i: one(i, [r["advice"] for r in ok if r is not r1[i]]), range(len(advisors))))
+        spent += sum(r["cost"] for r in r2)
+    final = [r for r in (r2 or r1) if "advice" in r]
+    synthesis = None
+    if synth and final:
+        s = cfg["synth"]
+        try:
+            synthesis, cost = ask(cfg["providers"][s["provider"]], s["model"], s["effort"],
+                                  synth_prompt(question, final), SYNTH_SCHEMA)
+            spent += cost
+        except Exception as e:
+            synthesis = {"error": str(e)[:300]}
+    record = {"question": question, "risk": risk, "rounds": rounds, "files": [c["path"] for c in context],
+              "redactions": {c["path"]: c["redactions"] for c in context if c["redactions"]},
+              "round1": r1, "round2": r2, "synthesis": synthesis, "spent_usd": round(spent, 4),
+              "at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    path = save(record, cfg)
+    out(f"saved {path}  (spent ${spent:.2f}; {len(final)}/{len(advisors)} advisors answered)")
+    return record
+
+
+def render(rec):
+    L = [f"# Council: {rec['question']}", "",
+         f"{rec['at']} - risk {rec['risk']} - rounds {rec['rounds']} - spent ${rec['spent_usd']:.2f}",
+         f"Files sent: {', '.join(rec['files']) or 'none'}", ""]
+    for label, rows in (("Round 1", rec["round1"]), ("Round 2", rec["round2"])):
+        if not rows:
+            continue
+        L += [f"## {label}", "", "| Role | Model | Position | Confidence |", "|---|---|---|---|"]
+        for r in rows:
+            a = r.get("advice")
+            if a:
+                pos = a["position"].replace("|", "/").replace("\n", " ")
+            elif "unstructured" in r:
+                pos = "UNSTRUCTURED (raw text below)"
+            else:
+                pos = f"ERROR: {r['error']}"
+            L.append(f"| {r['role']} | {r['provider']}/{r['model']} | {pos} | {a['confidence'] if a else '-'} |")
+        L.append("")
+        for r in rows:
+            a = r.get("advice")
+            if "unstructured" in r:
+                L += [f"### {r['role']} (unstructured)", "", "```", r["unstructured"][:3000], "```", ""]
+            if a:
+                L += [f"### {r['role']}", "", "Reasons:", *[f"- {x}" for x in a["reasons"]], "", "Risks:",
+                      *[f"- {x}" for x in a["risks"]], "", f"Would change my mind: {a['change_my_mind']}", ""]
+    s = rec.get("synthesis")
+    L += ["## Synthesis", ""]
+    if s and "error" not in s:
+        L += ["Agreement:", *[f"- {x}" for x in s["agreement"]], "", "Disagreements:"]
+        for d in s["disagreements"]:
+            L.append(f"- {d['point']} - for: {d['strongest_for']} - against: {d['strongest_against']}")
+        L += ["", f"Recommendation: {s['recommendation']}", "", "Open questions:",
+              *[f"- {x}" for x in s["open_questions"]]]
+    else:
+        L.append("(to be written by the main session: agreement, disagreements with the strongest argument per "
+                 "side, recommendation, open questions)" + (f" - synth call failed: {s['error']}" if s else ""))
+    return "\n".join(L) + "\n"
+
+
+def save(rec, cfg):
+    d = os.path.join(cfg["root"], cfg["out_dir"])
+    os.makedirs(d, exist_ok=True)
+    base = os.path.join(d, f"{rec['at'].replace(':', '').replace('-', '')}-{slugify(rec['question'])}")
+    with open(base + ".md", "w") as fh:
+        fh.write(render(rec))
+    with open(base + ".json", "w") as fh:
+        json.dump(rec, fh, indent=1)
+    with open(os.path.join(d, "audit.log"), "a") as fh:
+        for r in (rec["round1"] + (rec["round2"] or [])):
+            fh.write(f"{rec['at']}\t{os.path.basename(base)}\t{r['provider']}\t{r['model']}\t"
+                     f"files={','.join(rec['files']) or '-'}\tredactions={sum(sum(c.values()) for c in rec['redactions'].values())}\t"
+                     f"cost={r['cost']:.4f}\t{'ok' if 'advice' in r else 'unstructured' if 'unstructured' in r else 'error'}\n")
+    return base + ".md"
+
+
+def main(argv=None):
+    a = list(sys.argv[1:] if argv is None else argv)
+    if not a or a[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+
+    def opt(name, default=None):
+        if name in a:
+            i = a.index(name)
+            v = a[i + 1]
+            del a[i:i + 2]
+            return v
+        return default
+
+    files = []
+    while "-c" in a:
+        i = a.index("-c")
+        j = i + 1
+        while j < len(a) and not a[j].startswith("-"):
+            files.append(a[j])
+            j += 1
+        del a[i:j]
+    cfg = load_config(find_config(opt("--config")))
+    if opt("--out"):
+        cfg["out_dir"] = opt("--out")
+    risk, rounds = opt("--risk", "med"), opt("--rounds")
+    flags = {f: (f in a) for f in ("--synth", "--dry-run", "--allow-external")}
+    question = " ".join(x for x in a if x not in flags).strip()
+    if not question:
+        raise SystemExit("a question is required")
+    try:
+        run_council(question, files, cfg, risk, rounds, flags["--synth"], flags["--dry-run"], flags["--allow-external"])
+    except Refused as e:
+        raise SystemExit(f"consult refused: {e}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
