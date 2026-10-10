@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "model": "opus",
+  "effortLevel": "medium",
+  "permissions": {
+    "allow": [
+      "Bash(git status *)", "Bash(git status)", "Bash(git diff *)", "Bash(git diff)", "Bash(git log *)",
+      "Bash(git show *)", "Bash(git branch *)", "Bash(git fetch *)", "Bash(git worktree list *)",
+      "Bash(gh pr view *)", "Bash(gh pr list *)", "Bash(gh pr diff *)", "Bash(gh pr checks *)",
+      "Bash(gh run list *)", "Bash(gh run view *)", "Bash(gh issue view *)", "Bash(gh issue list *)",
+      "Bash(./.claude/bin/octl status *)", "Bash(./.claude/bin/octl status)", "Bash(./.claude/bin/octl blocked)",
+      "Bash(./.claude/bin/octl task *)", "Bash(./.claude/bin/octl route *)", "Bash(./.claude/bin/octl brief *)",
+      "Bash(./.claude/bin/octl tokens *)", "Bash(./.claude/bin/octl tokens)", "Bash(./.claude/bin/octl mig list)",
+      "Bash(./.claude/bin/octl port list)",
+      "Bash(go build *)", "Bash(go vet *)", "Bash(go test *)",
+      "Bash(npm test *)", "Bash(npm run lint *)", "Bash(npm run typecheck *)", "Bash(npx vitest *)",
+      "Bash(pytest *)", "Bash(python3 -m pytest *)", "Bash(python3 -m unittest *)",
+      "Bash(make test *)", "Bash(make lint *)"
+    ],
+    "ask": [
+      "Bash(gh pr merge *)", "Bash(gh release *)", "Bash(gh repo *)", "Bash(gh api -X *)",
+      "Bash(gh api --method *)", "Bash(gh secret *)", "Bash(gh workflow run *)",
+      "Bash(npm publish *)", "Bash(docker push *)", "Bash(git tag *)",
+      "Bash(./.claude/bin/octl deploy *)", "Bash(./.claude/bin/octl spawn *)"
+    ],
+    "deny": [
+      "Read(./.env)", "Read(./.env.*)", "Read(./**/.env)", "Read(./**/.env.*)",
+      "Read(~/.ssh/**)", "Read(~/.aws/**)", "Read(~/.config/gh/**)",
+      "Bash(git push --force *)", "Bash(git push -f *)", "Bash(git reset --hard origin/*)",
+      "Bash(docker system prune *)", "Bash(docker volume prune *)", "Bash(docker container prune *)",
+      "Bash(docker image prune *)", "Bash(sudo *)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/scripts/guard-bash.py", "timeout": 10 }
+        ]
+      },
+      {
+        "matcher": "mcp__.*",
+        "hooks": [
+          { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/scripts/guard-mcp.py", "timeout": 10 }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/scripts/session-status.sh", "timeout": 15 }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "python3 \"${CLAUDE_PROJECT_DIR:-.}\"/.claude/statusline.py",
+    "padding": 0
+  }
+}
