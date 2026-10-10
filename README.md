@@ -1,4 +1,4 @@
-# claude-kit: an orchestration kit for Claude Code
+# orchestrator-kit: an orchestration kit for Claude Code
 
 Run software development with several Claude Code agents without burning tokens or losing control:
 model routing, a staged workflow with gates, a task board with resource reservations, a merge-queue
@@ -15,7 +15,7 @@ Requirements: Claude Code (tested with 2.1.293), Python 3.10+, `git`, and `gh` f
 ## First 10 minutes
 
 ```bash
-git clone https://github.com/openctemio/claude-kit && cd claude-kit
+git clone https://github.com/openctemio/orchestrator-kit && cd orchestrator-kit
 python3 -m unittest discover -s tests -p "test_*.py"     # 56 tests, a few seconds
 
 # Option A - template (recommended to start; you can read and edit every file)
@@ -29,7 +29,7 @@ claude                               # session starts with octl status in contex
 #   then: /dispatch  (starts T001 with the routed agent and model)
 
 # Option B - plugin
-claude plugin marketplace add openctemio/claude-kit
+claude plugin marketplace add openctemio/orchestrator-kit
 claude plugin install orchestrator-kit@openctem-kit
 # copy templates/octl.json to your repo root (set "agent_prefix": "orchestrator-kit:")
 # and merge templates/settings.json (permissions, status line) into .claude/settings.json
