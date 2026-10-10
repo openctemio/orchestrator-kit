@@ -43,7 +43,9 @@ enabling it is up to you), and `docs/cheatsheet.md` is the one-page reference.
 ```
 .claude-plugin/plugin.json, marketplace.json   plugin manifest (validated with claude plugin validate --strict)
 agents/        scout (haiku, read-only), rebaser (sonnet), fixer (sonnet), implementer (opus), reviewer (sonnet, read-only)
-skills/        dispatch, workflow, unjam, token-audit, handoff, deploy, council
+skills/        dispatch, workflow, unjam, token-audit, handoff, deploy, council, agent-briefing,
+               verify-before-done, pr-review-sweep, merge-queue-stacks, security-first-design,
+               safe-live-db-query, silent-failure-sweep, ui-consistency
 hooks/         hooks.json + scripts: guard-bash.py, guard-mcp.py, session-status.sh
 bin/octl       supervisor: board, routing, gates, reservations, watcher, tokens, deploy, timer (stdlib Python)
 bin/consult    advisor council (stdlib Python)
@@ -93,6 +95,22 @@ flowchart TB
 4. `octl unjam` (or the timer) merges clean PRs; `/unjam` turns blocked PRs into rebaser tasks.
 5. `/deploy` when the owner asks; `/handoff` before ending a long session.
 
+## Practice skills
+
+Besides the orchestration skills, the kit ships skills that encode lessons from running many agents on one
+product. Claude loads each one only when its description matches the work:
+
+| Skill | Use it when |
+|---|---|
+| `verify-before-done` | before any commit, push or "done": build, tests, fail-before test, functional check, CI |
+| `pr-review-sweep` | before marking a PR ready: fix, reply to and resolve every human and bot thread |
+| `merge-queue-stacks` | stacked PRs or migration-numbered PRs going through a squash merge queue |
+| `security-first-design` | designing or reviewing routes, queries, integrations, jobs in a multi-tenant system |
+| `safe-live-db-query` | any query against a production database |
+| `silent-failure-sweep` | bug hunts and audits: features that are wired but never run |
+| `ui-consistency` | UI fixes: fix everywhere through shared components, measure instead of eyeballing |
+| `agent-briefing` | writing a brief for a subagent (pairs with `templates/BRIEF-common.md`) |
+
 ## Nested CLAUDE.md
 
 Keep the root `CLAUDE.md` short: it loads into every session. Put area rules in `<dir>/CLAUDE.md`
@@ -124,7 +142,7 @@ new migration matches `destructive_regex`, and always restarts it.
 
 Verified against the docs (code.claude.com/docs) and the installed CLI 2.1.293:
 plugin manifest and layout (`claude plugin validate --strict` passes for plugin and marketplace; `claude plugin
-details` lists 7 skills, 5 agents, 2 hook events, about 920 always-on tokens); plugin `bin/` on the Bash PATH;
+details` lists 15 skills, 5 agents, 2 hook events, about 1,670 always-on tokens); plugin `bin/` on the Bash PATH;
 agent fields (`tools`, `disallowedTools`, `model`, `effort`, `maxTurns`, `color`); skill fields (`description`,
 `argument-hint`, `arguments`, `disable-model-invocation`); hook events, matchers, `permissionDecision`
 deny/ask and SessionStart `additionalContext`; status line input (`context_window.*`); settings `model`,
