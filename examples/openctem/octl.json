@@ -1,0 +1,40 @@
+{
+  "$comment": "The OpenCTEM host configuration, equivalent to the original agent-ops/supervisor/octl. Copy to /home/ubuntu/projects/openctemio/agent-ops/supervisor/octl.json and the scripts next to it. state_dir is new so the original board (older column layout) is not overwritten.",
+  "root": "/home/ubuntu/projects/openctemio",
+  "repo": "openctemio/openctem",
+  "base_branch": "develop",
+  "merge_queue": true,
+  "max_agents": 4,
+  "ctx_warn": 400000,
+  "disk_min_gb": 30,
+  "state_dir": "agent-ops/supervisor/state-kit",
+  "work_dir": "agent-ops/work",
+  "workspaces_file": "agent-ops/workspaces.tsv",
+  "brief_common": "agent-ops/BRIEF-common.md",
+  "handoff_file": "HANDOFF.md",
+  "hold_file": "agent-ops/hold.txt",
+  "agent_prefix": "orchestrator-kit:",
+  "transcripts_dir": "/home/ubuntu/.claude/projects/-home-ubuntu-projects-openctemio",
+  "ci_ignore": ["E2E", "Playwright"],
+  "keep_containers": ["openctemio-", "openctem-sensor-01"],
+  "routing": {
+    "kind_tier": {"migration": "sonnet", "sensor": "opus"}
+  },
+  "migrations": {"dir": "api/migrations", "pattern": "^(\\d{6})_.+\\.up\\.sql$", "width": 6, "gap": 10},
+  "alerts": {
+    "telegram_token_env": "ALERT_TELEGRAM_BOT_TOKEN",
+    "telegram_chat_env": "ALERT_TELEGRAM_CHAT_ID",
+    "env_file": ".env"
+  },
+  "live": {
+    "checkout": "openctem",
+    "health": "bash agent-ops/supervisor/health.sh",
+    "version": "bash agent-ops/supervisor/version.sh",
+    "rehearse": "bash agent-ops/supervisor/rehearse.sh {sha}",
+    "apply": "bash agent-ops/supervisor/apply.sh {sha}",
+    "verify": "bash agent-ops/supervisor/verify.sh",
+    "stop": "docker stop openctemio-api-1",
+    "start": "docker start openctemio-api-1",
+    "destructive_regex": "\\b(DROP\\s+TABLE|DROP\\s+COLUMN|RENAME\\s+(TO|COLUMN)|ALTER\\s+TABLE\\s+\\S+\\s+RENAME)\\b"
+  }
+}

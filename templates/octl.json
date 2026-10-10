@@ -1,0 +1,23 @@
+{
+  "$comment": "octl config. Relative paths resolve against this file's directory unless root is set. No secrets here: alerts name env vars only.",
+  "repo": "your-org/your-repo",
+  "base_branch": "main",
+  "merge_queue": false,
+  "merge_method": "squash",
+  "max_agents": 4,
+  "ctx_warn": 400000,
+  "disk_min_gb": 20,
+  "state_dir": ".octl/state",
+  "work_dir": ".octl/work",
+  "brief_common": ".claude/BRIEF-common.md",
+  "handoff_file": "HANDOFF.md",
+  "hold_file": ".octl/hold.txt",
+  "agent_prefix": "",
+  "ci_ignore": [],
+  "keep_containers": [],
+  "ports": {"min": 20000, "max": 29999},
+  "routing": {},
+  "migrations": null,
+  "alerts": {"webhook_url_env": "OCTL_WEBHOOK_URL"},
+  "live": null
+}

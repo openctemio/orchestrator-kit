@@ -1,0 +1,1289 @@
+#!/usr/bin/env python3
+"""octl - supervisor for running a project with several Claude Code agents.
+
+  octl status [--short]        base-branch CI, live, queue, PRs, disk, agents, tasks
+                               (--short reads local state only: no network, fast)
+  octl blocked                 why each open PR is not mergeable
+  octl unjam [--dry]           enqueue/auto-merge CLEAN PRs in stack order
+  octl route TITLE --kind K [--risk low|med|high] [--size S|M|L] [--fails N]
+                               model, effort, turn and token budget, agent for a task
+  octl task add PRIO KIND TITLE [--risk R] [--size S]   (routed automatically)
+  octl task list | next | show ID
+  octl task start ID RUNNER    claim a slot; stage -> plan (opus) or implement
+  octl task pr ID PRS          record the PR number(s)
+  octl task advance ID [--force]   move to the next workflow stage if its gate passes
+  octl task fail ID [REASON]   record a failed attempt; two fails escalate one tier
+  octl task block ID REASON | done ID
+  octl brief TASK_ID           ready-to-send agent brief for a task
+  octl spawn TASK_ID [--run]   headless `claude -p` run with the routed agent/model/effort
+  octl mig list | reserve NAME [N]   migration-number allocator
+  octl port list | reserve NAME [N]  scratch-port allocator (checks the port is free)
+  octl release NAME            drop NAME's port and migration reservations
+  octl tokens [--hours H] [--task ID]   token burn per transcript or per task
+  octl deploy rehearse|apply|verify [SHA]   runs the project's live hooks
+  octl watch                   one supervision tick (timer/cron)
+  octl install-timer [--write] [--cron] [--minutes M]
+
+Config: octl.json found via --config PATH, $OCTL_CONFIG, or the nearest
+octl.json in the current directory or its parents. Relative paths in the config
+resolve against "root" (default: the directory holding octl.json).
+Python 3.10+, standard library only. No secrets are stored in state.
+"""
+import collections
+import contextlib
+import datetime as dt
+import fcntl
+import glob
+import io
+import json
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+
+DEFAULTS = {
+    "repo": "",                      # owner/name on GitHub
+    "base_branch": "main",
+    "merge_queue": False,            # True: enqueue via GraphQL; False: gh pr merge --auto
+    "merge_method": "squash",
+    "max_agents": 4,
+    "ctx_warn": 400_000,
+    "disk_min_gb": 20,
+    "routing": {},                   # overrides for ROUTING_DEFAULTS (see `octl route` and docs/routing.md)
+    "ports": {"min": 20000, "max": 29999},
+    "agent_prefix": "orchestrator-kit:",  # plugin agents are namespaced; "" when agents live in .claude/agents
+    "spawn_args": [],                # extra `claude -p` args for `octl spawn`, e.g. ["--permission-mode", "auto"]
+    "hold_file": "hold.txt",
+    "state_dir": ".octl/state",
+    "work_dir": "work",
+    "workspaces_file": "",
+    "brief_common": "BRIEF-common.md",
+    "handoff_file": "HANDOFF.md",
+    "transcripts_dir": "",
+    "ci_ignore": [],                 # substrings of workflow names that never make the branch red
+    "keep_containers": [],           # name prefixes that are not scratch containers
+    "migrations": None,              # {"dir": "db/migrations", "pattern": "^(\\d+)_.+\\.up\\.sql$", "width": 6, "gap": 10}
+    "alerts": {},                    # {"telegram_token_env", "telegram_chat_env", "webhook_url_env", "env_file"}
+    "council": None,                 # read by bin/consult (see docs/council.md)
+    "live": None,                    # see README: checkout, health, version, rehearse, apply, verify, stop, start, destructive_regex
+}
+
+SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+
+
+# ---------------------------------------------------------------- config
+class Config(dict):
+    def path_of(self, v):
+        v = os.path.expanduser(v)
+        return v if os.path.isabs(v) else os.path.join(self["root"], v)
+
+    def path(self, key):
+        v = self.get(key) or ""
+        return self.path_of(v) if v else ""
+
+
+def transcripts_dir_for(project_root):
+    """Claude Code keeps transcripts in ~/.claude/projects/<path, non-alphanumerics replaced by '-'>."""
+    return os.path.join(os.path.expanduser("~/.claude/projects"), re.sub(r"[^A-Za-z0-9]", "-", project_root))
+
+
+def find_config(argv, env=os.environ, cwd=None):
+    if "--config" in argv:
+        i = argv.index("--config")
+        p = argv[i + 1]
+        del argv[i:i + 2]
+        return os.path.abspath(p)
+    if env.get("OCTL_CONFIG"):
+        return os.path.abspath(env["OCTL_CONFIG"])
+    d = os.path.abspath(cwd or os.getcwd())
+    while True:
+        cand = os.path.join(d, "octl.json")
+        if os.path.isfile(cand):
+            return cand
+        parent = os.path.dirname(d)
+        if parent == d:
+            return ""
+        d = parent
+
+
+def load_config(path):
+    raw = {}
+    if path:
+        try:
+            with open(path) as fh:
+                raw = json.load(fh)
+        except (OSError, ValueError) as e:
+            raise SystemExit(f"{path}: {e}")
+    unknown = set(raw) - set(DEFAULTS) - {"root", "$comment"}
+    if unknown:
+        raise SystemExit(f"octl.json: unknown keys {sorted(unknown)}")
+    cfg = Config(json.loads(json.dumps(DEFAULTS)))
+    cfg.update(raw)
+    cfg["root"] = os.path.abspath(os.path.expanduser(raw.get("root") or (os.path.dirname(path) if path else os.getcwd())))
+    if cfg["repo"] and not re.fullmatch(r"[\w.-]+/[\w.-]+", cfg["repo"]):
+        raise SystemExit("octl.json: repo must be owner/name")
+    if not isinstance(cfg["max_agents"], int) or cfg["max_agents"] < 1:
+        raise SystemExit("octl.json: max_agents must be a positive integer")
+    m = cfg.get("migrations")
+    if m:
+        if "dir" not in m or "pattern" not in m:
+            raise SystemExit("octl.json: migrations needs dir and pattern")
+        re.compile(m["pattern"])
+        m.setdefault("width", 6)
+        m.setdefault("gap", 10)
+    if not cfg["transcripts_dir"]:
+        cfg["transcripts_dir"] = transcripts_dir_for(cfg["root"])
+    return cfg
+
+
+CFG = Config()
+
+
+def state(name):
+    d = CFG.path("state_dir")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, name)
+
+
+# ---------------------------------------------------------------- helpers
+def run(args, timeout=120, cwd=None):
+    """Run without a shell; return stdout ('' on failure)."""
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return r.stdout.strip()
+
+
+def run_shell(cmd, timeout=900, **subst):
+    """Run a project-configured shell command. Substituted values are quoted."""
+    for k, v in subst.items():
+        cmd = cmd.replace("{" + k + "}", shlex.quote(v))
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout, cwd=CFG["root"])
+    return r.returncode, (r.stdout + r.stderr).strip()
+
+
+def gh_json(args):
+    out = run(["gh"] + args)
+    try:
+        return json.loads(out) if out else None
+    except ValueError:
+        return None
+
+
+def gql(query, **vars_):
+    args = ["gh", "api", "graphql", "-f", f"query={query}"]
+    for k, v in vars_.items():
+        args += ["-F" if isinstance(v, int) else "-f", f"{k}={v}"]
+    out = run(args)
+    try:
+        return json.loads(out) if out else {}
+    except ValueError:
+        return {}
+
+
+def owner_name():
+    return CFG["repo"].split("/", 1)
+
+
+def now():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def need_repo():
+    if not CFG["repo"]:
+        raise SystemExit("octl.json: repo is not set")
+
+
+# ---------------------------------------------------------------- PRs / queue
+def open_prs():
+    return gh_json(["pr", "list", "-R", CFG["repo"], "--limit", "100", "--json",
+                    "number,title,headRefName,headRefOid,mergeStateStatus,isDraft,baseRefName,files"]) or []
+
+
+def queue_entries():
+    if not CFG["merge_queue"]:
+        return []
+    o, n = owner_name()
+    d = gql("query($o:String!,$n:String!,$b:String!){repository(owner:$o,name:$n){mergeQueue(branch:$b){"
+            "entries(first:50){nodes{position state pullRequest{number}}}}}}", o=o, n=n, b=CFG["base_branch"])
+    try:
+        return [(x["position"], x["pullRequest"]["number"], x["state"])
+                for x in d["data"]["repository"]["mergeQueue"]["entries"]["nodes"]]
+    except (KeyError, TypeError):
+        return []
+
+
+def unresolved_threads(num):
+    o, n = owner_name()
+    d = gql("query($o:String!,$n:String!,$p:Int!){repository(owner:$o,name:$n){pullRequest(number:$p){"
+            "reviewThreads(first:100){nodes{isResolved}}}}}", o=o, n=n, p=int(num))
+    try:
+        return sum(1 for t in d["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"] if not t["isResolved"])
+    except (KeyError, TypeError):
+        return -1
+
+
+def failing_checks(num):
+    fails, pend = [], []
+    for line in run(["gh", "pr", "checks", str(num), "-R", CFG["repo"]]).splitlines():
+        p = line.split("\t")
+        if len(p) >= 2:
+            if p[1] == "fail":
+                fails.append(p[0])
+            elif p[1] == "pending":
+                pend.append(p[0])
+    return fails, pend
+
+
+def contains(a_sha, b_sha):
+    """True when commit a contains commit b."""
+    st = run(["gh", "api", f"repos/{CFG['repo']}/compare/{b_sha}...{a_sha}", "-q", ".status"])
+    return st in ("ahead", "identical")
+
+
+def holds():
+    try:
+        with open(CFG.path("hold_file")) as fh:
+            return {l.strip().lstrip("#") for l in fh if l.strip() and not l.startswith("//")}
+    except OSError:
+        return set()
+
+
+def stack_order(prs, contains_fn=None):
+    """Topological order: a PR whose head contains another open PR's head goes after it."""
+    contains_fn = contains_fn or contains
+    nums = [p["number"] for p in prs]
+    deps = {n: set() for n in nums}
+    for a in prs:
+        for b in prs:
+            if a is not b and contains_fn(a["headRefOid"], b["headRefOid"]):
+                deps[a["number"]].add(b["number"])
+    order, done = [], set()
+    while len(order) < len(nums):
+        ready = [n for n in nums if n not in done and deps[n] <= done]
+        if not ready:  # cycle (identical heads): fall back to number order
+            ready = [n for n in nums if n not in done]
+        n = min(ready)
+        order.append(n)
+        done.add(n)
+    return order, deps
+
+
+def merge_one(num):
+    if CFG["merge_queue"]:
+        nid = run(["gh", "pr", "view", str(num), "-R", CFG["repo"], "--json", "id", "-q", ".id"])
+        d = gql("mutation($id:ID!){enqueuePullRequest(input:{pullRequestId:$id}){mergeQueueEntry{position}}}", id=nid)
+        if d.get("errors") or not d.get("data"):
+            return (d.get("errors") or [{}])[0].get("message", "error")
+        return f"queued at {d['data']['enqueuePullRequest']['mergeQueueEntry']['position']}"
+    r = subprocess.run(["gh", "pr", "merge", str(num), "-R", CFG["repo"], "--auto", f"--{CFG['merge_method']}"],
+                       capture_output=True, text=True)
+    return "auto-merge set" if r.returncode == 0 else (r.stderr.strip().splitlines() or ["error"])[-1]
+
+
+def cmd_unjam(dry=False):
+    need_repo()
+    prs = [p for p in open_prs() if not p["isDraft"] and p["baseRefName"] == CFG["base_branch"]]
+    queued = {n for _, n, _ in queue_entries()}
+    held = holds()
+    clean = [p for p in prs if p["mergeStateStatus"] == "CLEAN" and p["number"] not in queued
+             and str(p["number"]) not in held]
+    order, _ = stack_order(clean) if clean else ([], {})
+    acted = [f"#{n} {'dry-run' if dry else merge_one(n)}" for n in order]
+    print("\n".join(acted) if acted else "nothing CLEAN to merge")
+    return acted
+
+
+def cmd_blocked():
+    need_repo()
+    prs = [p for p in open_prs() if not p["isDraft"]]
+    queued = {n for _, n, _ in queue_entries()}
+    held = holds()
+    for p in sorted(prs, key=lambda x: x["number"]):
+        n, st = p["number"], p["mergeStateStatus"]
+        if n in queued:
+            print(f"#{n} in queue")
+            continue
+        why = []
+        if st == "DIRTY":
+            why.append(f"conflicts with {CFG['base_branch']}")
+        elif st in ("BLOCKED", "UNSTABLE", "BEHIND", "UNKNOWN"):
+            f, pnd = failing_checks(n)
+            if f:
+                why.append("failing: " + ", ".join(f[:4]))
+            if pnd:
+                why.append(f"{len(pnd)} checks pending")
+            u = unresolved_threads(n)
+            if u > 0:
+                why.append(f"{u} unresolved threads")
+        if str(n) in held:
+            why.append("held")
+        print(f"#{n} {st}: {'; '.join(why) or 'ok'}  [{p['headRefName']}]")
+
+
+# ---------------------------------------------------------------- migrations
+def mig_number(path):
+    m = CFG.get("migrations")
+    if not m:
+        return None
+    d = m["dir"].strip("/")
+    if os.path.dirname(path).strip("/") != d:
+        return None
+    mm = re.match(m["pattern"], os.path.basename(path))
+    return int(mm.group(1)) if mm else None
+
+
+def base_max():
+    m = CFG["migrations"]
+    out = run(["gh", "api", f"repos/{CFG['repo']}/contents/{m['dir'].strip('/')}?ref={CFG['base_branch']}",
+               "-q", ".[].name"])
+    nums = [mig_number(f"{m['dir'].strip('/')}/{x}") for x in out.split()]
+    return max([x for x in nums if x is not None] or [0])
+
+
+def open_pr_max(prs=None):
+    best = 0
+    for p in prs if prs is not None else open_prs():
+        for f in p.get("files") or []:
+            n = mig_number(f.get("path", ""))
+            if n is not None:
+                best = max(best, n)
+    return best
+
+
+def ledger():
+    rows = []
+    try:
+        with open(state("migrations.tsv")) as fh:
+            for l in fh:
+                p = l.rstrip("\n").split("\t")
+                if len(p) >= 4 and p[0].isdigit():
+                    rows.append(p)
+    except OSError:
+        pass
+    return rows
+
+
+def next_block(used, count, gap=10):
+    """First number of a block of `count` above everything used, rounded up to the next multiple of gap
+    so a neighbour can still add one migration after the current maximum."""
+    if count < 1:
+        raise ValueError("count must be >= 1")
+    top = max(list(used) + [0])
+    return (top // gap + 1) * gap
+
+
+def cmd_mig(args):
+    m = CFG.get("migrations")
+    if not m:
+        raise SystemExit("octl.json: migrations is not configured")
+    need_repo()
+    w = m["width"]
+    if not args or args[0] == "list":
+        for r in ledger():
+            print("\t".join(r))
+        print(f"{CFG['base_branch']} max {base_max():0{w}d}, open PR max {open_pr_max():0{w}d}")
+        return
+    if args[0] == "reserve" and len(args) >= 2:
+        name, count = args[1], int(args[2]) if len(args) > 2 else 1
+        start = next_block([base_max(), open_pr_max()] + [int(r[0]) for r in ledger()], count, m["gap"])
+        with open(state("migrations.tsv"), "a") as fh:
+            for i in range(count):
+                fh.write(f"{start + i:0{w}d}\t{name}\t{now():%Y-%m-%d}\treserved\n")
+        print(f"reserved {start:0{w}d}..{start + count - 1:0{w}d} for {name}")
+        return
+    raise SystemExit("usage: octl mig list | reserve NAME [N]")
+
+
+# ---------------------------------------------------------------- routing
+TIERS = ["haiku", "sonnet", "opus"]
+ROUTING_DEFAULTS = {
+    # base tier per kind of work
+    "kind_tier": {
+        "lookup": "haiku", "status": "haiku", "triage": "haiku",
+        "rebase": "sonnet", "ci": "sonnet", "conflict": "sonnet", "docs": "sonnet",
+        "mechanical": "sonnet", "change": "sonnet", "review": "sonnet",
+        "feature": "opus", "design": "opus", "security": "opus", "ui": "opus", "debug": "opus",
+    },
+    "default_tier": "sonnet",
+    # kinds whose size/risk never raise the tier (no code is changed)
+    "no_raise": ["lookup", "status", "triage", "docs"],
+    # kinds that always stay on at least this tier
+    "floor": {"security": "opus"},
+    "effort": {"haiku": "low", "sonnet": "medium", "opus": "high"},
+    "max_turns": {"S": 30, "M": 60, "L": 120},
+    "haiku_max_turns": 20,
+    # per-task budget in millions of cache-read tokens (the dominant cost)
+    "budget_m": {"S": 15, "M": 40, "L": 100},
+    "fails_to_escalate": 2,
+    # agent files in agents/*.md; each pins its own model
+    "agents": {"haiku": "scout", "sonnet": "fixer", "opus": "implementer"},
+    "agent_by_kind": {"rebase": "rebaser", "ci": "rebaser", "conflict": "rebaser", "review": "reviewer"},
+}
+RISKS = ("low", "med", "high")
+SIZES = ("S", "M", "L")
+
+
+def routing_cfg():
+    r = json.loads(json.dumps(ROUTING_DEFAULTS))
+    for k, v in (CFG.get("routing") or {}).items():
+        if isinstance(v, dict) and isinstance(r.get(k), dict):
+            r[k].update(v)
+        else:
+            r[k] = v
+    return r
+
+
+def route(kind, risk="med", size="M", fails=0, rc=None):
+    """Pick model, effort, turn/token budget and agent for one task.
+
+    base tier from the kind; risk high or size L raise one tier (not for no-code kinds);
+    every `fails_to_escalate` failed attempts raise one more tier; capped at opus."""
+    rc = rc or routing_cfg()
+    if risk not in RISKS or size not in SIZES:
+        raise SystemExit(f"risk must be one of {RISKS}, size one of {SIZES}")
+    tier = TIERS.index(rc["kind_tier"].get(kind, rc["default_tier"]))
+    if kind not in rc["no_raise"]:
+        if risk == "high" or size == "L":
+            tier += 1
+        if risk == "high":
+            tier = max(tier, 1)
+    if kind in rc["floor"]:
+        tier = max(tier, TIERS.index(rc["floor"][kind]))
+    tier += int(fails) // max(int(rc["fails_to_escalate"]), 1)
+    tier = min(tier, len(TIERS) - 1)
+    model = TIERS[tier]
+    effort = rc["effort"][model]
+    if model == "opus" and risk == "high":
+        effort = "xhigh"
+    turns = rc["max_turns"][size]
+    budget = rc["budget_m"][size]
+    if model == "haiku":
+        turns = min(turns, rc["haiku_max_turns"])
+        budget = min(budget, rc["budget_m"]["S"])
+    agent = rc["agent_by_kind"].get(kind)
+    if agent == "rebaser" and model == "opus":
+        agent = None  # escalated mechanical work goes to the implementer
+    if agent == "rebaser" and model == "haiku":
+        agent = None
+    agent = agent or rc["agents"][model]
+    return {"model": model, "effort": effort, "max_turns": turns, "budget_m": budget,
+            "agent": agent}
+
+
+def opt(args, name, default=None):
+    if name in args:
+        i = args.index(name)
+        val = args[i + 1] if i + 1 < len(args) else ""
+        del args[i:i + 2]
+        return val
+    return default
+
+
+def cmd_route(args):
+    args = list(args)
+    kind = opt(args, "--kind", "change")
+    risk, size = opt(args, "--risk", "med"), opt(args, "--size", "M")
+    fails = int(opt(args, "--fails", "0"))
+    r = route(kind, risk, size, fails)
+    title = " ".join(args)
+    print(f"{title + ': ' if title else ''}agent={r['agent']} model={r['model']} effort={r['effort']} "
+          f"max_turns={r['max_turns']} budget={r['budget_m']}M")
+    return r
+
+
+# ---------------------------------------------------------------- task board + workflow
+TASK_COLS = ["id", "prio", "kind", "risk", "size", "model", "effort", "max_turns", "budget_m", "agent",
+             "status", "stage", "fails", "runner", "prs", "title"]
+STAGES = ["intake", "plan", "implement", "verify", "review", "ci", "queue", "deploy", "handoff", "done"]
+
+
+@contextlib.contextmanager
+def locked():
+    """Serialize every read-modify-write of the state files (several agents may call octl at once)."""
+    with open(state(".lock"), "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def tasks():
+    rows = []
+    try:
+        with open(state("tasks.tsv")) as fh:
+            for l in fh:
+                p = l.rstrip("\n").split("\t")
+                if p and p[0] != "id" and len(p) >= len(TASK_COLS):
+                    rows.append(dict(zip(TASK_COLS, p)))
+    except OSError:
+        pass
+    return rows
+
+
+def save_tasks(rows):
+    tmp = state("tasks.tsv.tmp")
+    with open(tmp, "w") as fh:
+        fh.write("\t".join(TASK_COLS) + "\n")
+        for r in rows:
+            fh.write("\t".join(str(r.get(c, "")).replace("\t", " ").replace("\n", " ") for c in TASK_COLS) + "\n")
+    os.replace(tmp, state("tasks.tsv"))
+
+
+def task_log(tid, msg):
+    with open(state("tasks.log"), "a") as fh:
+        fh.write(f"{now():%FT%TZ}\t{tid}\t{msg}\n")
+
+
+def note_path(tid):
+    return state(f"notes/{tid}.md")
+
+
+def next_stage(t, has_live):
+    i = STAGES.index(t["stage"])
+    nxt = STAGES[i + 1]
+    if nxt == "plan" and t["model"] != "opus":
+        nxt = "implement"
+    if nxt == "deploy" and not has_live:
+        nxt = "handoff"
+    return nxt
+
+
+def pr_numbers(t):
+    return [p.lstrip("#") for p in re.split(r"[ ,]+", t["prs"]) if p.lstrip("#").isdigit()]
+
+
+def gate(t, nxt):
+    """None when the task may enter stage `nxt`, else the reason it may not."""
+    prs = pr_numbers(t)
+    if nxt == "implement" and t["stage"] == "plan" and not os.path.exists(note_path(t["id"])):
+        return f"plan stage needs a design note at {note_path(t['id'])}"
+    if nxt in ("verify", "review", "ci", "queue") and not prs:
+        return "no PR recorded (octl task pr ID N)"
+    if nxt == "queue":
+        for n in prs:
+            v = gh_json(["pr", "view", n, "-R", CFG["repo"], "--json", "mergeStateStatus,isDraft"]) or {}
+            if v.get("isDraft") or v.get("mergeStateStatus") != "CLEAN":
+                return f"#{n} is {v.get('mergeStateStatus', 'unknown')}{' (draft)' if v.get('isDraft') else ''}"
+            u = unresolved_threads(n)
+            if u != 0:
+                return f"#{n} has {u} unresolved review threads"
+    if nxt in ("deploy", "handoff") and t["stage"] == "queue":
+        for n in prs:
+            v = gh_json(["pr", "view", n, "-R", CFG["repo"], "--json", "state"]) or {}
+            if v.get("state") != "MERGED":
+                return f"#{n} is not merged yet"
+    if nxt == "handoff" and t["stage"] == "deploy":
+        try:
+            ok_at = float(open(state("verified")).read().strip())
+        except (OSError, ValueError):
+            return "no successful `octl deploy verify` recorded"
+        for n in prs:
+            v = gh_json(["pr", "view", n, "-R", CFG["repo"], "--json", "mergedAt"]) or {}
+            try:
+                if dt.datetime.fromisoformat(v["mergedAt"].replace("Z", "+00:00")).timestamp() > ok_at:
+                    return f"#{n} merged after the last successful deploy verify"
+            except (KeyError, AttributeError, ValueError):
+                return f"cannot read merge time of #{n}"
+    return None
+
+
+def find_task(rows, tid):
+    for r in rows:
+        if r["id"] == tid:
+            return r
+    raise SystemExit(f"no such task {tid}")
+
+
+def cmd_task(args):
+    args = list(args)
+    sub = args[0] if args else "list"
+    if sub == "add":
+        risk, size = opt(args, "--risk", "med"), opt(args, "--size", "M")
+        if len(args) < 4:
+            raise SystemExit("usage: octl task add PRIO KIND TITLE [--risk R] [--size S]")
+        prio, kind, title = args[1], args[2], " ".join(args[3:])
+        r = route(kind, risk, size)
+        with locked():
+            rows = tasks()
+            n = max([int(x["id"][1:]) for x in rows if x["id"][1:].isdigit()] + [0]) + 1
+            tid = f"T{n:03d}"
+            rows.append(dict(id=tid, prio=prio, kind=kind, risk=risk, size=size, status="todo", stage="intake",
+                             fails="0", runner="-", prs="-", title=title, **r))
+            save_tasks(rows)
+        task_log(tid, f"added {kind}/{risk}/{size} -> {r['agent']} {r['model']}")
+        print(f"{tid} agent={r['agent']} model={r['model']} effort={r['effort']} max_turns={r['max_turns']}")
+        return
+    if sub in ("start", "pr", "advance", "fail", "block", "done"):
+        if len(args) < 2:
+            raise SystemExit(f"usage: octl task {sub} ID ...")
+        tid, rest = args[1], args[2:]
+        force = "--force" in rest
+        rest = [x for x in rest if x != "--force"]
+        with locked():
+            rows = tasks()
+            t = find_task(rows, tid)
+            msg = sub
+            if sub == "start":
+                if t["status"] == "todo" and sum(r["status"] == "doing" for r in rows) >= CFG["max_agents"] and not force:
+                    raise SystemExit(f"{CFG['max_agents']} agents already running (use --force to exceed)")
+                t["status"], t["runner"] = "doing", (rest[0] if rest else t["runner"])
+                if t["stage"] == "intake":
+                    t["stage"] = next_stage(t, bool(live_cfg()))
+                msg = f"start {t['runner']} stage {t['stage']}"
+            elif sub == "pr":
+                t["prs"] = ",".join(rest) or "-"
+                msg = f"pr {t['prs']}"
+            elif sub == "advance":
+                if t["stage"] == "done":
+                    raise SystemExit("task is done")
+                nxt = next_stage(t, bool(live_cfg()))
+                why = None if force else gate(t, nxt)
+                if why:
+                    raise SystemExit(f"{tid} stays in {t['stage']}: {why}")
+                t["stage"] = nxt
+                if nxt == "done":
+                    t["status"] = "done"
+                msg = f"stage {nxt}{' (forced)' if force else ''}"
+            elif sub == "fail":
+                t["fails"] = str(int(t["fails"] or 0) + 1)
+                old = t["model"]
+                t.update(route(t["kind"], t["risk"], t["size"], int(t["fails"])))
+                t["status"] = "todo"
+                msg = f"fail {t['fails']}: {' '.join(rest)}" + (f"; escalated {old} -> {t['model']}" if t["model"] != old else "")
+            elif sub == "block":
+                t["status"] = "blocked"
+                msg = f"blocked: {' '.join(rest)}"
+            elif sub == "done":
+                t["status"], t["stage"] = "done", "done"
+                if rest:
+                    t["prs"] = ",".join(rest)
+            save_tasks(rows)
+        task_log(tid, msg)
+        print(f"{tid} {msg}")
+        return
+    rows = tasks()
+    if sub == "show":
+        t = find_task(rows, args[1])
+        print("\n".join(f"{c:10} {t[c]}" for c in TASK_COLS))
+        try:
+            print("".join(l for l in open(state("tasks.log")) if f"\t{t['id']}\t" in l)[-1500:])
+        except OSError:
+            pass
+        return
+    if sub == "next":
+        doing = [r for r in rows if r["status"] == "doing"]
+        free = max(CFG["max_agents"] - len(doing), 0)
+        todo = sorted([r for r in rows if r["status"] == "todo"], key=lambda r: (r["prio"], r["id"]))
+        print(f"{len(doing)} running, {free} slot(s) free (max {CFG['max_agents']})")
+        for r in todo[:free]:
+            print(f"  start {r['id']} [{r['prio']}] agent={r['agent']} model={r['model']} effort={r['effort']} {r['title']}")
+        return
+    for r in sorted(rows, key=lambda r: (r["status"] == "done", r["prio"], r["id"])):
+        print(f"{r['id']} {r['prio']:3} {r['status']:7} {r['stage']:9} {r['kind']:9} {r['agent']:11} {r['model']:6} "
+              f"{r['runner']:14} {r['prs']:10} {r['title']}")
+
+
+BRIEF = """[agent: {agent}  model: {model}  effort: {effort}  maxTurns: {max_turns}]
+Task {id} ({kind}, risk {risk}, size {size}, priority {prio}): {title}
+
+FIRST read {brief_common} and follow every rule, especially "Token budget":
+filter all command output, no polling turns, run only the tests you touched, report ONCE at the end, then stop.
+Workspace: {work}/ only. {register}Make one git worktree per PR inside it; never write elsewhere.
+{mig}
+Workflow (you own stages {own}): {plan}implement in your worktree (one PR to {base}) -> self-verify (touched tests,
+plus a test that fails without the change) -> push and open the PR -> CI green and every review thread resolved.
+Record progress with `octl task pr {id} N` and `octl task advance {id}`; the orchestrator runs review, queue and deploy.
+Budget: about {budget_m}M cache-read tokens and {max_turns} turns. Keep context small.
+Stop and report (do not push on) when: the PR is green and clean; the budget or turn limit is near; the same gate failed
+twice (run `octl task fail {id} "<why>"`); you need an owner decision; or the next step is outward-facing or
+irreversible (publishing, merging, deleting data, touching production, sending messages).
+Final report (plain English, short): what changed, PR numbers, what was verified, anything the owner must decide."""
+
+
+def cmd_brief(tid):
+    t = find_task(tasks(), tid)
+    res = [r for r in ledger() if r[1] == tid]
+    if not CFG.get("migrations"):
+        mig = ""
+    elif res:
+        mig = f"Migration numbers reserved for you: {', '.join(r[0] for r in res)}."
+    else:
+        mig = f"If you need a migration, run `octl mig reserve {tid} N` first and use exactly those numbers."
+    ports = [r[0] for r in port_ledger() if r[1] == tid]
+    if ports:
+        mig += f" Scratch ports reserved for you: {', '.join(ports)}."
+    else:
+        mig += f" Scratch services: `octl port reserve {tid} N` for ports; name containers {tid.lower()}-*; remove them before you report."
+    ws = CFG.path("workspaces_file")
+    opus = t["model"] == "opus"
+    print(BRIEF.format(**t, brief_common=CFG.path("brief_common"), base=CFG["base_branch"],
+                       work=os.path.join(CFG.path("work_dir"), tid.lower()), mig=mig.strip(),
+                       register=f"Register it in {ws}. " if ws else "",
+                       own="plan..ci" if opus else "implement..ci",
+                       plan=(f"plan (write a short design note to {note_path(tid)}: problem, approach, threat model, "
+                             f"tests; then `octl task advance {tid}`) -> ") if opus else ""))
+
+
+def spawn_command(t, brief):
+    return (["claude", "-p", brief, "--agent", CFG["agent_prefix"] + t["agent"], "--model", t["model"],
+             "--effort", t["effort"], "--output-format", "json"] + list(CFG["spawn_args"]))
+
+
+def cmd_spawn(args):
+    """Print (default) or start (--run) one headless agent run for a task, detached, output to a log."""
+    tid = args[0]
+    t = find_task(tasks(), tid)
+    buf, old = io.StringIO(), sys.stdout
+    sys.stdout = buf
+    try:
+        cmd_brief(tid)
+    finally:
+        sys.stdout = old
+    cmd = spawn_command(t, buf.getvalue())
+    if "--run" not in args:
+        print(" ".join(shlex.quote(c) for c in cmd[:2]) + " \"$(octl brief " + tid + ")\" " +
+              " ".join(shlex.quote(c) for c in cmd[3:]))
+        print("# add --run to start it detached (log in the state dir)")
+        return
+    os.makedirs(state("runs"), exist_ok=True)
+    log = open(state(f"runs/{tid}.json"), "w")
+    p = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                         cwd=CFG["root"], start_new_session=True)
+    with open(state(f"runs/{tid}.pid"), "w") as fh:
+        fh.write(str(p.pid))
+    cmd_task(["start", tid, f"pid-{p.pid}"])
+
+
+# ---------------------------------------------------------------- port reservations
+def port_ledger():
+    rows = []
+    try:
+        with open(state("ports.tsv")) as fh:
+            for l in fh:
+                p = l.rstrip("\n").split("\t")
+                if len(p) >= 2 and p[0].isdigit():
+                    rows.append(p)
+    except OSError:
+        pass
+    return rows
+
+
+def port_free(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def pick_ports(count, lo, hi, taken, free_fn=None):
+    free_fn = free_fn or port_free
+    out = []
+    for p in range(lo, hi + 1):
+        if p not in taken and free_fn(p):
+            out.append(p)
+            if len(out) == count:
+                return out
+    raise SystemExit(f"no {count} free ports in {lo}-{hi}")
+
+
+def cmd_port(args):
+    if not args or args[0] == "list":
+        for r in port_ledger():
+            print("\t".join(r))
+        return
+    if args[0] == "reserve" and len(args) >= 2:
+        name, count = args[1], int(args[2]) if len(args) > 2 else 1
+        with locked():
+            taken = {int(r[0]) for r in port_ledger()}
+            got = pick_ports(count, CFG["ports"]["min"], CFG["ports"]["max"], taken)
+            with open(state("ports.tsv"), "a") as fh:
+                for p in got:
+                    fh.write(f"{p}\t{name}\t{now():%Y-%m-%d}\n")
+        print(f"reserved ports {' '.join(map(str, got))} for {name}")
+        return
+    raise SystemExit("usage: octl port list | reserve NAME [N]")
+
+
+def cmd_release(name):
+    with locked():
+        for fname, rows in (("ports.tsv", port_ledger()), ("migrations.tsv", ledger())):
+            keep = [r for r in rows if r[1] != name]
+            with open(state(fname), "w") as fh:
+                fh.write("".join("\t".join(r) + "\n" for r in keep))
+    print(f"released reservations of {name}")
+
+
+# ---------------------------------------------------------------- tokens
+def transcript_usage(path, since):
+    """(turns, Counter of usage fields, largest context) for assistant messages after `since` (epoch)."""
+    c, seen, ctx, turns = collections.Counter(), set(), 0, 0
+    with open(path, errors="ignore") as fh:
+        for line in fh:
+            if '"usage"' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            m = d.get("message") if isinstance(d, dict) else None
+            u = m.get("usage") if isinstance(m, dict) else None
+            if not u or d.get("type") != "assistant" or m.get("id") in seen:
+                continue
+            try:
+                if dt.datetime.fromisoformat(d.get("timestamp", "").replace("Z", "+00:00")).timestamp() < since:
+                    continue
+            except ValueError:
+                pass
+            seen.add(m.get("id"))
+            turns += 1
+            for k in ("cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens", "input_tokens"):
+                c[k] += u.get(k, 0) or 0
+            ctx = max(ctx, sum(u.get(k, 0) or 0 for k in
+                               ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")))
+    return turns, c, ctx
+
+
+TASK_RE = re.compile(r"\bTask (T\d{3,})\b")
+
+
+def transcript_task(path):
+    """Task id named in the first user message of a transcript (the brief), or ''."""
+    try:
+        with open(path, errors="ignore") as fh:
+            for i, line in enumerate(fh):
+                if i > 50:
+                    break
+                if '"type":"user"' not in line.replace(" ", ""):
+                    continue
+                m = TASK_RE.search(line)
+                return m.group(1) if m else ""
+    except OSError:
+        pass
+    return ""
+
+
+def token_rows(hours, tdir=None):
+    tdir = tdir or CFG["transcripts_dir"]
+    since = now().timestamp() - hours * 3600
+    files = [f for f in glob.glob(f"{tdir}/*.jsonl") + glob.glob(f"{tdir}/*/subagents/*.jsonl")
+             if os.path.getmtime(f) >= since]
+    rows, total = [], collections.Counter()
+    for f in files:
+        turns, c, ctx = transcript_usage(f, since)
+        if turns:
+            rows.append((c["cache_read_input_tokens"], os.path.basename(f)[:26], turns, ctx, c["output_tokens"],
+                         transcript_task(f)))
+            total += c
+    rows.sort(reverse=True)
+    return rows, total
+
+
+def task_usage(rows):
+    """{task id: (cache-read tokens, turns, transcripts)} from token_rows output."""
+    out = {}
+    for cr, _, turns, _, _, tid in rows:
+        if tid:
+            a = out.get(tid, (0, 0, 0))
+            out[tid] = (a[0] + cr, a[1] + turns, a[2] + 1)
+    return out
+
+
+def over_budget(rows, board):
+    use = task_usage(rows)
+    return [(t["id"], use[t["id"]][0] / 1e6, float(t["budget_m"])) for t in board
+            if t["id"] in use and t["budget_m"] and use[t["id"]][0] / 1e6 > float(t["budget_m"])]
+
+
+def cmd_tokens(hours=24, quiet=False, task=None):
+    rows, total = token_rows(hours)
+    if quiet:
+        return rows
+    if task is not None:
+        board = {t["id"]: t for t in tasks()}
+        for tid, (cr, turns, n) in sorted(task_usage(rows).items()):
+            if task in ("", tid):
+                b = board.get(tid, {}).get("budget_m", "")
+                flag = "  <-- over budget" if b and cr / 1e6 > float(b) else ""
+                print(f"{tid}  {cr/1e6:7.1f}M read (budget {b or '-'}M)  {turns:5d} turns  {n} transcript(s){flag}")
+        return rows
+    print(f"last {hours}h  cache-read {total['cache_read_input_tokens']/1e6:.0f}M  cache-write "
+          f"{total['cache_creation_input_tokens']/1e6:.0f}M  output {total['output_tokens']/1e6:.1f}M  "
+          f"transcripts {len(rows)}")
+    for cr, name, turns, ctx, _, tid in rows[:12]:
+        flag = "  <-- big context: restart fresh" if ctx > CFG["ctx_warn"] else ""
+        print(f"  {cr/1e6:7.1f}M read  {turns:5d} turns  ctx {ctx/1e3:4.0f}k  {name} {tid}{flag}")
+    return rows
+
+
+# ---------------------------------------------------------------- live / status
+def live_cfg():
+    return CFG.get("live") or {}
+
+
+def live_state():
+    lv = live_cfg()
+    if not lv:
+        return "-", "-", "-"
+    pin = run(["git", "-C", CFG.path_of(lv["checkout"]), "rev-parse", "--short", "HEAD"]) if lv.get("checkout") else "-"
+    ver = run_shell(lv["version"], timeout=60)[1] if lv.get("version") else "-"
+    if lv.get("health"):
+        rc, out = run_shell(lv["health"], timeout=60)
+        ready = f"ok {out[-40:]}".strip() if rc == 0 else f"DOWN {out[-60:]}"
+    else:
+        ready = "-"
+    return pin, ver, ready
+
+
+def disk_free_gb():
+    try:
+        st = os.statvfs(CFG["root"])
+        return st.f_bavail * st.f_frsize // 2**30
+    except OSError:
+        return -1
+
+
+def base_ci():
+    runs = gh_json(["run", "list", "-R", CFG["repo"], "-b", CFG["base_branch"], "--limit", "15",
+                    "--json", "name,conclusion,headSha,status"]) or []
+    if not runs:
+        return "unknown", ""
+    head = runs[0]["headSha"]
+    mine = [r for r in runs if r["headSha"] == head]
+    bad = [r["name"] for r in mine if r["conclusion"] in ("failure", "cancelled", "timed_out")
+           and not any(s in r["name"] for s in CFG["ci_ignore"])]
+    running = [r for r in mine if r["status"] != "completed"]
+    return ("red: " + ", ".join(bad)) if bad else ("running" if running else "green"), head[:9]
+
+
+def active_agents():
+    out = []
+    try:
+        with open(CFG.path("workspaces_file")) as fh:
+            for l in fh:
+                p = l.rstrip("\n").split("\t")
+                if len(p) > 2 and "active" in p:
+                    name = os.path.basename(p[0].rstrip("/"))
+                    if name not in out:
+                        out.append(name)
+    except OSError:
+        pass
+    return out
+
+
+def task_summary():
+    t = tasks()
+    if not t:
+        return ""
+    c = collections.Counter(r["status"] for r in t)
+    free = max(CFG["max_agents"] - c.get("doing", 0), 0)
+    return ", ".join(f"{k} {v}" for k, v in c.items()) + f"; {free} agent slot(s) free"
+
+
+def cmd_status_short():
+    """Local state only (for the SessionStart hook): last watch tick, open alerts, task board."""
+    last = "no watch tick yet"
+    try:
+        with open(state("watch.log")) as fh:
+            lines = fh.readlines()
+            if lines:
+                last = lines[-1].strip()
+    except OSError:
+        pass
+    try:
+        with open(state("alerts.json")) as fh:
+            alerts = list(json.load(fh).values())
+    except (OSError, ValueError):
+        alerts = []
+    print(f"octl: repo {CFG['repo'] or '-'} base {CFG['base_branch']} max agents {CFG['max_agents']}")
+    print(f"last tick: {last[:200]}")
+    print("alerts: " + ("; ".join(alerts)[:300] if alerts else "none"))
+    print("tasks: " + (task_summary() or "board empty"))
+    print("run `octl status` for live detail, `octl task next` for what to start")
+
+
+def cmd_status():
+    need_repo()
+    prs = open_prs()
+    q = queue_entries()
+    by = collections.Counter(p["mergeStateStatus"] for p in prs if not p["isDraft"])
+    ci, head = base_ci()
+    print(f"{CFG['base_branch']:7} {head} CI {ci}")
+    if live_cfg():
+        pin, ver, ready = live_state()
+        print(f"live    {pin} version {ver} health {ready}")
+    if CFG["merge_queue"]:
+        print(f"queue   {len(q)}: " + " ".join(f"#{n}" for _, n, _ in q))
+    print(f"PRs     {len(prs)} open: " + ", ".join(f"{k} {v}" for k, v in by.most_common()))
+    names = run(["docker", "ps", "--format", "{{.Names}}"]).split()
+    scratch = [c for c in names if not any(c.startswith(k) for k in CFG["keep_containers"])]
+    print(f"disk    {disk_free_gb()} GB free; scratch containers: {', '.join(scratch) or 'none'}")
+    if CFG.path("workspaces_file"):
+        ag = active_agents()
+        print(f"agents  {len(ag)} active workspaces (max {CFG['max_agents']}): {', '.join(ag) or 'none'}")
+    ts = task_summary()
+    if ts:
+        print(f"tasks   {ts}")
+
+
+# ---------------------------------------------------------------- deploy
+def new_migrations(checkout, sha, live_ver):
+    m = CFG.get("migrations")
+    if not m:
+        return []
+    out = run(["git", "-C", checkout, "ls-tree", "--name-only", sha, m["dir"].strip("/") + "/"])
+    return sorted(f for f in out.split() if (mig_number(f) or 0) > live_ver)
+
+
+def destructive(checkout, sha, files, regex):
+    pat = re.compile(regex, re.I)
+    return [os.path.basename(f) for f in files if pat.search(run(["git", "-C", checkout, "show", f"{sha}:{f}"]))]
+
+
+def cmd_deploy(args):
+    lv = live_cfg()
+    if not lv:
+        raise SystemExit("octl.json: live is not configured")
+    sub = args[0] if args else "verify"
+    if sub in ("rehearse", "apply"):
+        checkout = CFG.path_of(lv["checkout"])
+        run(["git", "-C", checkout, "fetch", "-q", "origin", CFG["base_branch"]], timeout=300)
+        sha = run(["git", "-C", checkout, "rev-parse", args[1] if len(args) > 1 else f"origin/{CFG['base_branch']}"])
+        if not SHA_RE.match(sha):
+            raise SystemExit(f"cannot resolve a commit: {sha!r}")
+        ci, head = base_ci()
+        if head and sha.startswith(head) and ci != "green":
+            raise SystemExit(f"{CFG['base_branch']} CI is {ci}; refusing")
+        if sub == "rehearse":
+            rc, out = run_shell(lv["rehearse"], sha=sha)
+            print("\n".join(out.splitlines()[-40:]))
+            if rc == 0:
+                with open(state("rehearsed"), "w") as fh:
+                    fh.write(sha)
+            raise SystemExit(rc)
+        try:
+            rehearsed = open(state("rehearsed")).read().strip()
+        except OSError:
+            rehearsed = ""
+        if rehearsed != sha:
+            raise SystemExit(f"run `octl deploy rehearse {sha[:9]}` first (last rehearsed: {rehearsed[:9] or 'none'})")
+        live_ver = int(re.sub(r"\D", "", live_state()[1]) or 0)
+        files = new_migrations(checkout, sha, live_ver)
+        hits = destructive(checkout, sha, files, lv["destructive_regex"]) if lv.get("destructive_regex") else []
+        stop = bool(hits) and bool(lv.get("stop"))
+        print(f"{len(files)} new migrations; destructive: {', '.join(hits) or 'none'}; stop service: {stop}")
+        if stop:
+            run_shell(lv["stop"])
+        try:
+            rc, out = run_shell(lv["apply"], sha=sha)
+            print("\n".join(out.splitlines()[-20:]))
+        finally:
+            if stop:
+                run_shell(lv["start"])
+        if rc:
+            raise SystemExit(f"apply failed (exit {rc})")
+        os.remove(state("rehearsed"))
+        hf = CFG.path("handoff_file")
+        if hf and os.path.exists(hf):
+            with open(hf, "a") as fh:
+                fh.write(f"- {now():%Y-%m-%d %H:%M} UTC live {sha[:9]} deployed by octl "
+                         f"(migrations {len(files)}, destructive {len(hits)}, stopped {stop})\n")
+        print("applied; run `octl deploy verify` in about a minute")
+        return
+    if not lv.get("verify"):
+        raise SystemExit("octl.json: live.verify is not configured")
+    rc, out = run_shell(lv["verify"], timeout=300)
+    if rc == 0:
+        with open(state("verified"), "w") as fh:
+            fh.write(str(now().timestamp()))
+    print("\n".join(out.splitlines()[-20:]) + f"\n-> {'OK' if rc == 0 else 'CHECK'}")
+    raise SystemExit(rc)
+
+
+# ---------------------------------------------------------------- watch + alerts
+def read_env_file(path, keys):
+    out = {}
+    try:
+        with open(path) as fh:
+            for l in fh:
+                if "=" in l and not l.lstrip().startswith("#"):
+                    k, v = l.rstrip("\n").split("=", 1)
+                    if k.strip() in keys:
+                        out[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return out
+
+
+def alert(msg):
+    a = CFG.get("alerts") or {}
+    keys = [a.get(k) for k in ("telegram_token_env", "telegram_chat_env", "webhook_url_env") if a.get(k)]
+    if not keys:
+        return
+    env = {k: os.environ[k] for k in keys if os.environ.get(k)}
+    if a.get("env_file") and len(env) < len(keys):
+        env = {**read_env_file(CFG.path_of(a["env_file"]), keys), **env}
+    text = f"[octl {CFG['repo']}] {msg}"
+    tok, chat = env.get(a.get("telegram_token_env", "")), env.get(a.get("telegram_chat_env", ""))
+    try:
+        if tok and chat:
+            data = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
+            urllib.request.urlopen(f"https://api.telegram.org/bot{tok}/sendMessage", data=data, timeout=15)
+        hook = env.get(a.get("webhook_url_env", ""))
+        if hook and hook.startswith("https://"):
+            req = urllib.request.Request(hook, data=json.dumps({"text": text}).encode(),
+                                         headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=15)
+    except OSError:
+        pass
+
+
+def diff_alerts(prev, cur):
+    """Messages to send: new or changed problems, and cleared ones."""
+    msgs = [v for k, v in cur.items() if prev.get(k) != v]
+    msgs += [f"resolved: {v}" for k, v in prev.items() if k not in cur]
+    return msgs
+
+
+def cmd_watch():
+    need_repo()
+    try:
+        prev = json.load(open(state("alerts.json")))
+    except (OSError, ValueError):
+        prev = {}
+    cur = {}
+    ci, head = base_ci()
+    if ci.startswith("red"):
+        cur["ci"] = f"{CFG['base_branch']} {head} {ci}"
+    pin = ver = ready = "-"
+    if live_cfg():
+        pin, ver, ready = live_state()
+        if ready.startswith("DOWN"):
+            cur["live"] = f"live health {ready}"
+        if "DIRTY" in ver:
+            cur["mig"] = f"live schema version dirty at {ver}"
+    free = disk_free_gb()
+    if 0 <= free < CFG["disk_min_gb"]:
+        cur["disk"] = f"disk {free} GB free (<{CFG['disk_min_gb']})"
+    acted = cmd_unjam() if not ci.startswith("red") else []
+    big = [r for r in cmd_tokens(1, quiet=True) if r[3] > CFG["ctx_warn"]] \
+        if os.path.isdir(CFG["transcripts_dir"]) else []
+    if len(big) > CFG["max_agents"]:
+        cur["tokens"] = f"{len(big)} transcripts above {CFG['ctx_warn']//1000}k context in the last hour"
+    if os.path.isdir(CFG["transcripts_dir"]):
+        for tid, used, budget in over_budget(cmd_tokens(24, quiet=True), [t for t in tasks() if t["status"] == "doing"]):
+            cur[f"budget-{tid}"] = f"{tid} used {used:.0f}M cache-read tokens (budget {budget:.0f}M): stop or restart it fresh"
+    for m in diff_alerts(prev, cur):
+        alert(m)
+    json.dump(cur, open(state("alerts.json"), "w"))
+    with open(state("watch.log"), "a") as fh:
+        fh.write(f"{now():%FT%TZ} ci={ci} live={pin}/{ver}/{ready[:20]} disk={free} merged={len(acted)} "
+                 f"alerts={list(cur)}\n")
+
+
+# ---------------------------------------------------------------- timer
+def unit_name():
+    return "octl-" + re.sub(r"[^A-Za-z0-9]+", "-", os.path.basename(CFG["root"])).strip("-").lower()
+
+
+def timer_units(minutes, octl_path, config_path):
+    svc = f"""[Unit]
+Description=octl watch tick for {CFG['root']}
+
+[Service]
+Type=oneshot
+WorkingDirectory={CFG['root']}
+ExecStart={sys.executable} {octl_path} --config {config_path} watch
+TimeoutStartSec=600
+Nice=10
+"""
+    tmr = f"""[Unit]
+Description=Run octl watch every {minutes} minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec={minutes}min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+    return svc, tmr
+
+
+def cmd_install_timer(args, config_path):
+    minutes = int(args[args.index("--minutes") + 1]) if "--minutes" in args else 10
+    octl_path = os.path.abspath(__file__)
+    if "--cron" in args:
+        print(f"*/{minutes} * * * * cd {shlex.quote(CFG['root'])} && {sys.executable} {shlex.quote(octl_path)} "
+              f"--config {shlex.quote(config_path)} watch >/dev/null 2>&1")
+        return
+    svc, tmr = timer_units(minutes, octl_path, config_path)
+    name = unit_name()
+    if "--write" not in args:
+        print(f"# {name}.service\n{svc}\n# {name}.timer\n{tmr}\n# write with: octl install-timer --write")
+        return
+    d = os.path.expanduser("~/.config/systemd/user")
+    os.makedirs(d, exist_ok=True)
+    for ext, body in (("service", svc), ("timer", tmr)):
+        with open(f"{d}/{name}.{ext}", "w") as fh:
+            fh.write(body)
+    print(f"wrote {d}/{name}.service and .timer\nenable: systemctl --user daemon-reload && "
+          f"systemctl --user enable --now {name}.timer")
+
+
+# ---------------------------------------------------------------- main
+def main(argv=None):
+    a = list(sys.argv[1:] if argv is None else argv)
+    if not a or a[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    cfg_path = find_config(a)
+    if not cfg_path and a[0] not in ("tokens", "route"):
+        raise SystemExit("octl.json not found (use --config or OCTL_CONFIG)")
+    CFG.clear()
+    CFG.update(load_config(cfg_path))
+    c = a[0]
+    if c == "status":
+        cmd_status_short() if "--short" in a else cmd_status()
+    elif c == "unjam":
+        cmd_unjam(dry="--dry" in a)
+    elif c == "blocked":
+        cmd_blocked()
+    elif c == "mig":
+        cmd_mig(a[1:])
+    elif c == "task":
+        cmd_task(a[1:])
+    elif c == "brief" and len(a) > 1:
+        cmd_brief(a[1])
+    elif c == "tokens":
+        cmd_tokens(int(opt(a, "--hours", "24")), task=opt(a, "--task", "") if "--task" in a else None)
+    elif c == "spawn" and len(a) > 1:
+        cmd_spawn(a[1:])
+    elif c == "route":
+        cmd_route(a[1:])
+    elif c == "port":
+        cmd_port(a[1:])
+    elif c == "release" and len(a) > 1:
+        cmd_release(a[1])
+    elif c == "deploy":
+        cmd_deploy(a[1:])
+    elif c == "watch":
+        cmd_watch()
+    elif c == "install-timer":
+        cmd_install_timer(a[1:], cfg_path)
+    else:
+        print(__doc__)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

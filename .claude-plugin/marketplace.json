@@ -1,0 +1,15 @@
+{
+  "name": "openctem-kit",
+  "description": "OpenCTEM tooling for running software development with Claude Code agents.",
+  "owner": {
+    "name": "OpenCTEM",
+    "email": "info@openctem.io"
+  },
+  "plugins": [
+    {
+      "name": "orchestrator-kit",
+      "source": "./",
+      "description": "Multi-agent software-development harness: routing, staged workflow, task board, safety hooks, token budgets, advisor council."
+    }
+  ]
+}
