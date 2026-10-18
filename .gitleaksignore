@@ -1,0 +1,5 @@
+# Verified false positives in the history (commit:file:rule:line): documentation
+# placeholders and test fixtures, none a real credential (history audit 2026-10-18).
+# Add a line only after confirming the match is not a real credential.
+40a54f647d0dece90f21c24764cb51a9e268c7ca:examples/openctem/rehearse.sh:generic-credential-uri:20
+40a54f647d0dece90f21c24764cb51a9e268c7ca:examples/openctem/verify.sh:generic-password:5

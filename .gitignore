@@ -2,3 +2,13 @@ __pycache__/
 *.pyc
 .octl/
 .claude/council/
+
+# Secrets and runtime state: never committed
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+/data/
