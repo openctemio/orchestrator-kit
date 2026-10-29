@@ -25,7 +25,10 @@ Before enabling auto-merge on a PR:
    is UNMERGEABLE and still costs a rebuild.
 
 Never:
-- remove or re-add a queued entry, or push to a PR while it is queued;
+- remove or re-add a queued entry, or push to a PR while it is queued. One exception: the queue does
+  not drop an UNMERGEABLE entry at its head, and every entry behind it waits. If the head entry has been
+  UNMERGEABLE for more than about 10 minutes, dequeue it, fix the conflict on the branch, and re-enable
+  auto-merge only once it shows CLEAN;
 - cancel a merge-group run;
 - admin-merge;
 - add the security label yourself.
