@@ -45,7 +45,9 @@ enabling it is up to you), and `docs/cheatsheet.md` is the one-page reference.
 agents/        scout (haiku, read-only), rebaser (sonnet), fixer (sonnet), implementer (opus), reviewer (sonnet, read-only)
 skills/        dispatch, workflow, unjam, token-audit, handoff, deploy, council, agent-briefing,
                verify-before-done, pr-review-sweep, merge-queue-stacks, security-first-design,
-               safe-live-db-query, silent-failure-sweep, ui-consistency
+               safe-live-db-query, silent-failure-sweep, ui-consistency, merge-queue-keeper,
+               security-ack-review, ci-failure-triage, ui-device-qa, third-party-evaluation,
+               measure-then-decide
 hooks/         hooks.json + scripts: guard-bash.py, guard-mcp.py, session-status.sh
 bin/octl       supervisor: board, routing, gates, reservations, watcher, tokens, deploy, timer (stdlib Python)
 bin/consult    advisor council (stdlib Python)
@@ -110,6 +112,12 @@ product. Claude loads each one only when its description matches the work:
 | `silent-failure-sweep` | bug hunts and audits: features that are wired but never run |
 | `ui-consistency` | UI fixes: fix everywhere through shared components, measure instead of eyeballing |
 | `agent-briefing` | writing a brief for a subagent (pairs with `templates/BRIEF-common.md`) |
+| `merge-queue-keeper` | keeping many PRs flowing: rolling window, enqueue only clean PRs, never touch queued entries |
+| `security-ack-review` | re-approving a PR after its security label dropped: review the change since the last approval |
+| `ci-failure-triage` | red checks: newest run per workflow, real vs flake vs stale, queue-only failures |
+| `ui-device-qa` | screenshot bug reports: reproduce on device profiles, measure overflow and overlap |
+| `third-party-evaluation` | "should we use X": verify claims in code, supply chain, fit, borrow vs adopt |
+| `measure-then-decide` | redesign questions: numbers from the live system first, then options and decisions |
 
 ## Nested CLAUDE.md
 
