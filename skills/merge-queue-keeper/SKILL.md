@@ -33,6 +33,10 @@ Never:
 - admin-merge;
 - add the security label yourself.
 
+A PR known to fail in the queue (a fix is committed but cannot be pushed while queued) is the other
+exception: put it on the hold list first if an automation re-enqueues CLEAN PRs, then dequeue it, push,
+and re-enqueue once green. Before enqueueing a PR yourself, ask its keeper whether a fix is pending.
+
 If two PRs conflict and one contains the other (a stack), let the larger one merge and close the smaller
 as superseded. That is one queue run instead of two.
 
